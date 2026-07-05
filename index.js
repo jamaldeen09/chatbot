@@ -1,36 +1,50 @@
-import { ChatOpenAI } from "@langchain/openai";
-import { ChatPromptTemplate, MessagesPlaceholder } from "@langchain/core/prompts";
 import { AIMessage, HumanMessage } from "@langchain/core/messages";
 import dotenv from "dotenv";
-import readline from "readline"
+import readline from "readline";
+import { tool, createAgent } from "langchain"
+import { ChatOllama } from "@langchain/ollama";
+import z from "zod";
 dotenv.config();
 
-// Create model
-const model = new ChatOpenAI({
-    modelName: "nvidia/nemotron-3-ultra-550b-a55b:free",
-    apiKey: process.env.OPENROUTER_API_KEY,
-    verbose: false,
-    temperature: 0.7,
-    configuration: {
-        baseURL: "https://openrouter.ai/api/v1",
-        defaultHeaders: {
-            "HTTP-Referer": "http://localhost:3000",
-            "X-Title": "Sales Agent",
-        },
+const tavilySearch = tool(
+    async ({ query }) => {
+        const response = await fetch("https://api.tavily.com/search", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({
+                api_key: process.env.TAVILY_API_KEY,
+                query,
+                max_results: 5,
+            }),
+        });
+        const data = await response.json();
+        // Return clean results the agent can read
+        return data.results
+            .map((r) => `${r.title}: ${r.content}`)
+            .join("\n\n");
     },
+    {
+        name: "search_web",
+        description: "Search the web for information about any topic",
+        schema: z.object({
+            query: z.string().describe("The search query"),
+        }),
+    }
+);
+
+
+// Create model
+const model = new ChatOllama({
+    model: "llama3.2:1b",
+    temperature: 0.7,
 });
 
-
 const chatHistory = [];
-
-// Create prompt
-const prompt = ChatPromptTemplate.fromMessages([
-    ["system", "You are a helpful assistant called Max"],
-    new MessagesPlaceholder("chat_history"),
-    ["human", "{input}"]
-]);
-
-const chain = prompt.pipe(model); 
+const agent = createAgent({
+    model,
+    tools: [tavilySearch],
+    systemPrompt: "You are an helpful assitant that can browse the web and answer users questions efficiently"
+});
 
 // Get user input
 const rl = readline.createInterface({
@@ -38,17 +52,30 @@ const rl = readline.createInterface({
     output: process.stdout
 });
 
-function askQuestion () {
-    rl.question("User: ", async  (input) => {
+function askQuestion() {
+    rl.question("User: ", async (input) => {
+        const trimmed = input.trim()
         try {
-            const response = await chain.invoke({ input, chat_history: chatHistory });
-            chatHistory.push(new HumanMessage(input));
-            chatHistory.push(new AIMessage(response.content));
-    
-            console.log("Agent: ", response.content);
+            if (!trimmed) {
+                console.log("System: ", "Invalid input");
+                askQuestion();
+                return;
+            }
+
+            const response = await agent.invoke({ messages: [{ role: "user", content: trimmed }] });
+            const lastOutput = response.messages.at(-1)
+            const content = lastOutput ? lastOutput.content : null;
+            chatHistory.push(new HumanMessage(trimmed));
+            chatHistory.push(new AIMessage(content));
+
+            console.log("Agent: ", content);
             askQuestion();
-        } catch {
+        } catch (err) {
+            console.error("Error:", err);
             console.log("I'm sorry, i could not fufill your request");
+
+            // Ask the question again
+            askQuestion();
         }
     })
 }
